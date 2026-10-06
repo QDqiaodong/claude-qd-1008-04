@@ -1,0 +1,59 @@
+-- 球员差点指数重算 · 端到端手工验证脚本（按顺序执行；HTTP 状态码与消息均有断言点）
+-- 前置：./start.sh 起服务。种子含默认规则「WHS标准口径v1」(2026-01-01 生效)
+--   与 4 场历史已结束赛事（T-2026-005 未维护球场难度参数）。
+
+-- ===== A. 规则维护 =====
+GET /api/handicap-rules
+-- 预期：1 条 v1 规则，referenced=false（首次重算前）
+
+-- 新建规则：同一生效日只允许一条 → 400「已存在规则」
+POST /api/handicap-rules  {"ruleName":"重复生效日","effectiveDate":"2026-01-01","roundsWindow":20,"minRounds":3,"bestCountTable":"3:1,4:1,5:1","maxDifferential":40.0,"maxDrop":5.0}
+-- 非法映射表 → 400「采用个数须落在 1 ~ 样本轮数之间」
+POST /api/handicap-rules  {"ruleName":"坏表","effectiveDate":"2026-12-01","roundsWindow":20,"minRounds":3,"bestCountTable":"3:0","maxDifferential":40.0,"maxDrop":5.0}
+-- 合法新规则（2026-12-01 生效，收紧下调限幅）→ 200
+POST /api/handicap-rules  {"ruleName":"WHS标准口径v2","effectiveDate":"2026-12-01","roundsWindow":20,"minRounds":3,"bestCountTable":"3:1,4:1,5:1,6:2,7:2,8:2,9:3,10:3,11:3,12:4,13:4,14:4,15:5,16:5,17:5,18:6,19:6,20:8","maxDifferential":40.0,"maxDrop":1.0}
+
+-- ===== B. 全量重算（按赛事日期分批） =====
+POST /api/handicap-runs  {"asOfDate":"2026-10-06","batchSize":2,"triggeredBy":"管理员"}
+-- 预期：status=已完成, totalPlayers=7, successCount=3（球员1/2/3）,
+--   insufficientCount=4（球员4/5/6/8）, failCount=0
+GET /api/handicap-runs
+GET /api/handicap-runs/1/errors          -- 预期：空数组（无失败）
+
+-- 规则生效边界：基准日 2026-11-01 仍按 v1；基准日 2026-12-02 起按 v2
+POST /api/handicap-runs  {"asOfDate":"2026-11-01"}   -- 批次详情 ruleName=WHS标准口径v1
+POST /api/handicap-runs  {"asOfDate":"2026-12-02"}   -- 批次详情 ruleName=WHS标准口径v2
+
+-- 无生效规则 → 400「没有任何已生效的差点计算规则」
+POST /api/handicap-runs  {"asOfDate":"2020-01-01"}
+
+-- ===== C. 球员视角 =====
+GET /api/handicaps/players/1
+-- 预期（首轮重算后）：status=已计算, currentIndex=10.5, sampleSize=3, usedCount=1,
+--   ruleName=WHS标准口径v1；rounds 中 T-2026-006 采用、T-2026-005「缺球场难度参数」排除、
+--   其余「差值未进入最低 1 个」
+GET /api/handicaps/players/4             -- 预期：样本不足（仅缺参赛事的 1 轮可计 → 0 轮可计）
+GET /api/handicaps/players/1/history     -- 历次计算，含每次规则与变化
+GET /api/handicaps/summary               -- 球员列表页汇总
+
+-- ===== D. 缺参与定向重算 =====
+GET /api/handicaps/missing-params
+-- 预期：T-2026-005（受影响：林浩、陈雨桐、赵子涵）、T-2026-002（无已签核轮次）
+
+-- 参数成对校验：只填一个 → 400「需成对维护」
+PUT /api/tournaments/5  {"courseRating":29.5}
+-- 补齐参数 → 200
+PUT /api/tournaments/5  {"courseRating":29.5,"slopeRating":113}
+
+-- 定向重算受影响球员：林浩 10.5 → 8.5（T5 差值 8.5 进入最低 1 个，下调 -2.0 未超 5.0）
+POST /api/handicaps/recalc  {"playerIds":[1,2,4]}
+-- 预期：林浩 ok index=8.5；陈雨桐 ok index=13.5；赵子涵 ok 样本不足
+GET /api/handicaps/players/1/history
+-- 预期：两条记录（批次 10.5 → 定向 8.5，previousIndex/changeAmount 链完整）
+
+-- 定向重算含不存在球员 → 该条 ok=false「球员不存在：999」，其余正常（失败不中断）
+POST /api/handicaps/recalc  {"playerIds":[999,3]}
+
+-- ===== E. 规则引用保护 =====
+DELETE /api/handicap-rules/1
+-- 预期 400：「已被差点计算引用…不能删除」——历史指数按当时规则保持可追溯
