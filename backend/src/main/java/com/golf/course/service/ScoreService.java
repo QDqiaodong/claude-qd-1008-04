@@ -12,10 +12,12 @@ import com.golf.course.entity.Hole;
 import com.golf.course.entity.Player;
 import com.golf.course.entity.Score;
 import com.golf.course.entity.Tournament;
+import com.golf.course.entity.TournamentRoundHole;
 import com.golf.course.repository.HoleRepository;
 import com.golf.course.repository.PlayerRepository;
 import com.golf.course.repository.ScoreRepository;
 import com.golf.course.repository.TournamentRepository;
+import com.golf.course.repository.TournamentRoundHoleRepository;
 
 /**
  * 成绩业务：按洞录入杆数并与标准杆对比。
@@ -30,13 +32,16 @@ public class ScoreService {
     private final PlayerRepository playerRepository;
     private final TournamentRepository tournamentRepository;
     private final HoleRepository holeRepository;
+    private final TournamentRoundHoleRepository roundHoleRepository;
 
     public ScoreService(ScoreRepository scoreRepository, PlayerRepository playerRepository,
-                        TournamentRepository tournamentRepository, HoleRepository holeRepository) {
+                        TournamentRepository tournamentRepository, HoleRepository holeRepository,
+                        TournamentRoundHoleRepository roundHoleRepository) {
         this.scoreRepository = scoreRepository;
         this.playerRepository = playerRepository;
         this.tournamentRepository = tournamentRepository;
         this.holeRepository = holeRepository;
+        this.roundHoleRepository = roundHoleRepository;
     }
 
     public List<Score> list(Long tournamentId, Long playerId) {
@@ -69,6 +74,7 @@ public class ScoreService {
         }
         Player player = resolvePlayer(input.getPlayer());
         Hole hole = resolveHole(input.getHole());
+        validateHoleForTournament(locked, hole);
         if (input.getRoundNo() == null || input.getRoundNo() < 1) {
             throw new BizException("轮次必须大于 0");
         }
@@ -99,5 +105,35 @@ public class ScoreService {
         }
         return holeRepository.findById(h.getId())
                 .orElseThrow(() -> new BizException("球洞不存在：" + h.getId()));
+    }
+
+    /**
+     * 校验录入的洞属于该赛事本轮应打洞：
+     * 已开赛 → 必须在开赛冻结清单内（洞后来改维护 / 封闭不影响本轮，仍可录杆）；
+     * 报名中 → 必须属于赛事绑定球场且当前开放（与开赛校验口径一致）。
+     */
+    private void validateHoleForTournament(Tournament tournament, Hole hole) {
+        List<TournamentRoundHole> frozen =
+                roundHoleRepository.findByTournamentIdOrderByHoleNoAsc(tournament.getId());
+        if (!frozen.isEmpty()) {
+            boolean inFrozen = frozen.stream().anyMatch(rh -> hole.getHoleNo().equals(rh.getHoleNo()));
+            if (!inFrozen) {
+                throw new BizException("第 " + hole.getHoleNo() + " 洞不在赛事「" + tournament.getName()
+                        + "」开赛时冻结的本轮应打球洞清单内，不能录入本轮成绩");
+            }
+            return;
+        }
+        if (tournament.getCourse() == null) {
+            throw new BizException("赛事「" + tournament.getName()
+                    + "」尚未绑定球场，不能界定应打球洞，请先在赛事编辑中绑定球场");
+        }
+        if (hole.getCourse() == null || !tournament.getCourse().getId().equals(hole.getCourse().getId())) {
+            throw new BizException("第 " + hole.getHoleNo() + " 洞不属于赛事「" + tournament.getName()
+                    + "」绑定的「" + tournament.getCourse().getName() + "」，不能录入该赛事成绩");
+        }
+        if (!"开放".equals(hole.getStatus())) {
+            throw new BizException("第 " + hole.getHoleNo() + " 洞当前为「" + hole.getStatus()
+                    + "」，非应打球洞，不能录入；修复后可在开赛校验中放行");
+        }
     }
 }

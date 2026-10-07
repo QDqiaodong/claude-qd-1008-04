@@ -6,9 +6,12 @@ import java.time.LocalDateTime;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 
@@ -53,6 +56,14 @@ public class Tournament {
 
     @Column(name = "location", length = 48)
     private String location;
+
+    /**
+     * 赛事绑定的球场：开赛（报名中 → 进行中）前必须指定，系统按该球场读取全部应打球洞做可用性校验。
+     * 绑定后只允许在「报名中」阶段更换；进入进行中后冻结，后续把球洞改为维护 / 封闭不影响本轮。
+     */
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "course_id")
+    private Course course;
 
     /** 球场难度值（Course Rating），与 slopeRating 成对维护；旧数据可为 NULL */
     @Column(name = "course_rating", precision = 4, scale = 1)

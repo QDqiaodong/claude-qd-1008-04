@@ -28,18 +28,22 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.golf.course.common.ConflictException;
 import com.golf.course.dto.LeaderboardView;
+import com.golf.course.entity.Course;
 import com.golf.course.entity.Hole;
 import com.golf.course.entity.LeaderboardSnapshot;
 import com.golf.course.entity.Player;
 import com.golf.course.entity.Score;
 import com.golf.course.entity.Tournament;
 import com.golf.course.entity.TournamentEntry;
+import com.golf.course.entity.TournamentRoundHole;
+import com.golf.course.repository.CourseRepository;
 import com.golf.course.repository.HoleRepository;
 import com.golf.course.repository.LeaderboardSnapshotRepository;
 import com.golf.course.repository.PlayerRepository;
 import com.golf.course.repository.ScoreRepository;
 import com.golf.course.repository.TournamentEntryRepository;
 import com.golf.course.repository.TournamentRepository;
+import com.golf.course.repository.TournamentRoundHoleRepository;
 
 /**
  * 排行榜快照一致性集成测试（H2 MySQL 模式）：
@@ -55,6 +59,10 @@ class LeaderboardSnapshotIntegrationTest {
     @Autowired
     private HoleRepository holeRepository;
     @Autowired
+    private CourseRepository courseRepository;
+    @Autowired
+    private TournamentRoundHoleRepository roundHoleRepository;
+    @Autowired
     private ScoreRepository scoreRepository;
     @Autowired
     private TournamentEntryRepository entryRepository;
@@ -65,6 +73,8 @@ class LeaderboardSnapshotIntegrationTest {
     @Autowired
     private TournamentService tournamentService;
     @Autowired
+    private TournamentStartService startService;
+    @Autowired
     private ScoreService scoreService;
     @Autowired
     private ObjectMapper objectMapper;
@@ -73,6 +83,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    private Long courseId;
     private final List<Long> openHoleIds = new ArrayList<>();
 
     @BeforeEach
@@ -83,6 +94,8 @@ class LeaderboardSnapshotIntegrationTest {
         jdbc.execute("DELETE FROM handicap_run_error");
         jdbc.execute("DELETE FROM handicap_run");
         jdbc.execute("DELETE FROM handicap_rule");
+        jdbc.execute("DELETE FROM tournament_start_attempt");
+        jdbc.execute("DELETE FROM tournament_round_hole");
         jdbc.execute("DELETE FROM scorecard_event");
         jdbc.execute("DELETE FROM scorecard_hole");
         jdbc.execute("DELETE FROM scorecard");
@@ -94,10 +107,19 @@ class LeaderboardSnapshotIntegrationTest {
         jdbc.execute("DELETE FROM tournament");
         jdbc.execute("DELETE FROM player");
         jdbc.execute("DELETE FROM hole");
+        jdbc.execute("DELETE FROM course");
+
+        Course course = new Course();
+        course.setCourseNo("C-T1");
+        course.setName("测试场");
+        course.setHoleCount(5);
+        course.setCreatedAt(LocalDateTime.now());
+        courseId = courseRepository.save(course).getId();
 
         int[][] pars = {{1, 4}, {2, 5}, {3, 3}, {4, 4}, {5, 3}};
         for (int[] hp : pars) {
             Hole h = new Hole();
+            h.setCourse(course);
             h.setHoleNo(hp[0]);
             h.setPar(hp[1]);
             h.setYardage(300 + hp[0] * 10);
@@ -125,10 +147,28 @@ class LeaderboardSnapshotIntegrationTest {
         t.setEndDate(LocalDate.of(2026, 10, 12));
         t.setStatus(status);
         t.setLocation("A场");
+        t.setCourse(courseRepository.findById(courseId).orElseThrow());
         t.setCourseRating(new BigDecimal("28.8"));
         t.setSlopeRating(116);
         t.setCreatedAt(LocalDateTime.now());
         return tournamentRepository.save(t);
+    }
+
+    /** 模拟历史已开赛 / 进行中赛事：把当前 5 个开放洞冻结为本轮应打洞。 */
+    private void freezeRound(Tournament t) {
+        LocalDateTime at = LocalDateTime.now();
+        for (Long hid : openHoleIds) {
+            Hole h = holeRepository.findById(hid).orElseThrow();
+            TournamentRoundHole rh = new TournamentRoundHole();
+            rh.setTournament(t);
+            rh.setHole(h);
+            rh.setHoleNo(h.getHoleNo());
+            rh.setPar(h.getPar());
+            rh.setYardage(h.getYardage());
+            rh.setHoleVersion(0L);
+            rh.setFrozenAt(at);
+            roundHoleRepository.save(rh);
+        }
     }
 
     private void entry(Tournament t, Player p, int rounds) {
@@ -177,9 +217,8 @@ class LeaderboardSnapshotIntegrationTest {
         // 临时结果不落库
         assertThat(snapshotRepository.findByTournamentId(t.getId())).isEmpty();
 
-        // 赛事进入「进行中」，补完成绩，临时排名随之变化
-        t.setStatus("进行中");
-        tournamentRepository.save(t);
+        // 赛事进入「进行中」（走开赛校验并冻结本轮球洞），补完成绩，临时排名随之变化
+        startService.start(t.getId(), null, null);
         for (int h = 3; h <= 5; h++) {
             score(t, a, 1, h, 3 + h); // 6、7、8 → 甲合计 4+5+6+7+8 = 30
         }
@@ -201,6 +240,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void finalize_freezesOfficialSnapshot_andLaterScoreChangesDoNotAffectRanking() throws Exception {
         Tournament t = mkTournament("T-O1", "收口赛事", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TO-1", "甲", 10);
         Player b = mkPlayer("TO-2", "乙", 12);
         entry(t, a, 1);
@@ -261,6 +301,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void finalize_missingScores_failsNamingHole_rollsBackAndKeepsProvisional() {
         Tournament t = mkTournament("T-F1", "失败赛事A", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TF-0", "甲", 10);
         Player b = mkPlayer("TF-9", "乙", 12);
         entry(t, a, 1);
@@ -299,6 +340,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void finalize_illegalStrokes_failNamingPlayerHole_thenRetrySucceeds() {
         Tournament t = mkTournament("T-F2", "失败赛事B", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TF-1", "甲", 10);
         entry(t, a, 1);
         for (int h = 1; h <= 4; h++) {
@@ -328,6 +370,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void finalize_nonEntryOrOrphanScores_areRejected() {
         Tournament t = mkTournament("T-F3", "失败赛事C", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TF-3", "甲", 10);
         Player outsider = mkPlayer("TF-4", "圈外人", 20);
         entry(t, a, 1);
@@ -358,6 +401,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void concurrentFinalize_onlyOneOfficialSnapshot_winnerFreezesLosersConflict() throws Exception {
         Tournament t = mkTournament("T-C1", "并发赛事", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TC-1", "甲", 10);
         entry(t, a, 1);
         for (int h = 1; h <= 5; h++) {
@@ -406,6 +450,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void staleExpectedVersion_isRejectedAsConflict() {
         Tournament t = mkTournament("T-V1", "版本赛事", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TV-1", "甲", 10);
         entry(t, a, 1);
         for (int h = 1; h <= 5; h++) {
@@ -424,6 +469,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void http_finalizeFailReturns400WithReasons_andLeaderboardEndpointShowsFailure() throws Exception {
         Tournament t = mkTournament("T-H1", "接口赛事", "进行中");
+        freezeRound(t);
         Player a = mkPlayer("TH-1", "甲", 10);
         entry(t, a, 1);
         // 一洞都没录：必然收口失败
@@ -447,6 +493,7 @@ class LeaderboardSnapshotIntegrationTest {
     @Test
     void legacyFinishedTournamentWithoutSnapshot_isReadonlyHistoricalView() {
         Tournament t = mkTournament("T-L1", "历史赛事", "已结束");
+        freezeRound(t);
         Player a = mkPlayer("TL-1", "老甲", 10);
         entry(t, a, 1);
         for (int h = 1; h <= 5; h++) {
@@ -471,14 +518,20 @@ class LeaderboardSnapshotIntegrationTest {
             score(t, a, 1, h, 4);
         }
 
-        // 报名中 → 进行中：普通推进，返回 null（控制器回读实体）
-        assertThat(tournamentService.advance(t.getId(), "进行中", null)).isNull();
+        // 报名中 → 进行中：开赛校验通过，返回推进后的赛事实体（Object 形态）
+        Object started = tournamentService.advance(t.getId(), "进行中", null, null);
+        assertThat(started).isInstanceOf(Tournament.class);
+        assertThat(((Tournament) started).getStatus()).isEqualTo("进行中");
         assertThat(tournamentRepository.findById(t.getId()).orElseThrow().getStatus())
                 .isEqualTo("进行中");
+        // 开赛成功同时冻结了本轮 5 个应打球洞
+        assertThat(roundHoleRepository.findByTournamentIdOrderByHoleNoAsc(t.getId()))
+                .hasSize(5);
 
         // 进行中 → 已结束：返回冻结的正式排行榜视图
-        LeaderboardView official = tournamentService.advance(t.getId(), "已结束", null);
-        assertThat(official).isNotNull();
+        Object result = tournamentService.advance(t.getId(), "已结束", null, null);
+        assertThat(result).isInstanceOf(LeaderboardView.class);
+        LeaderboardView official = (LeaderboardView) result;
         assertThat(official.frozen()).isTrue();
         assertThat(tournamentRepository.findById(t.getId()).orElseThrow().getStatus())
                 .isEqualTo("已结束");
@@ -486,7 +539,7 @@ class LeaderboardSnapshotIntegrationTest {
                 .isEqualTo(LeaderboardSnapshot.TYPE_OFFICIAL);
 
         // 再次推进已结束赛事被状态机规则拒绝
-        assertThatThrownBy(() -> tournamentService.advance(t.getId(), "已结束", null))
+        assertThatThrownBy(() -> tournamentService.advance(t.getId(), "已结束", null, null))
                 .hasMessageContaining("不允许");
     }
 }

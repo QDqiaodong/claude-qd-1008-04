@@ -34,6 +34,7 @@ import com.golf.course.entity.ScorecardEvent;
 import com.golf.course.entity.ScorecardHole;
 import com.golf.course.entity.Tournament;
 import com.golf.course.entity.TournamentEntry;
+import com.golf.course.entity.TournamentRoundHole;
 import com.golf.course.repository.HoleRepository;
 import com.golf.course.repository.PlayerRepository;
 import com.golf.course.repository.ScorecardEventRepository;
@@ -41,6 +42,7 @@ import com.golf.course.repository.ScorecardHoleRepository;
 import com.golf.course.repository.ScorecardRepository;
 import com.golf.course.repository.TournamentEntryRepository;
 import com.golf.course.repository.TournamentRepository;
+import com.golf.course.repository.TournamentRoundHoleRepository;
 
 /**
  * 赛事记分卡签核闭环核心业务。
@@ -69,6 +71,7 @@ public class ScorecardService {
     private final PlayerRepository playerRepository;
     private final HoleRepository holeRepository;
     private final TournamentEntryRepository entryRepository;
+    private final TournamentRoundHoleRepository roundHoleRepository;
     private final ObjectMapper objectMapper;
 
     public ScorecardService(ScorecardRepository cardRepository,
@@ -78,6 +81,7 @@ public class ScorecardService {
                             PlayerRepository playerRepository,
                             HoleRepository holeRepository,
                             TournamentEntryRepository entryRepository,
+                            TournamentRoundHoleRepository roundHoleRepository,
                             ObjectMapper objectMapper) {
         this.cardRepository = cardRepository;
         this.holeLineRepository = holeLineRepository;
@@ -86,6 +90,7 @@ public class ScorecardService {
         this.playerRepository = playerRepository;
         this.holeRepository = holeRepository;
         this.entryRepository = entryRepository;
+        this.roundHoleRepository = roundHoleRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -162,7 +167,7 @@ public class ScorecardService {
                     card.setPlayer(player);
                     card.setRoundNo(roundNo);
                     card.setStatus(Dict.CARD_DRAFT);
-                    card.setExpectedHoles(openHoles().size());
+                    card.setExpectedHoles(expectedHoles(tournament).size());
                     card.setCreatedAt(LocalDateTime.now());
                     card.setUpdatedAt(LocalDateTime.now());
                     return cardRepository.save(card);
@@ -181,11 +186,13 @@ public class ScorecardService {
             throw new BizException("记分卡已提交（当前：" + card.getStatus()
                     + "），快照已固化，普通编辑不能改写；如需改判请走争议/裁决流程");
         }
-        Hole hole = holeRepository.findByHoleNo(req.holeNo())
-                .orElseThrow(() -> new BizException("球洞不存在：第 " + req.holeNo() + " 洞"));
-        if (!"开放".equals(hole.getStatus())) {
+        Hole hole = resolveTournamentHole(card.getTournament(), req.holeNo());
+        // 报名中草稿只允许录当前开放洞；已开赛赛事以开赛冻结清单为准（洞后来改维护 / 封闭仍可录）。
+        List<TournamentRoundHole> frozen =
+                roundHoleRepository.findByTournamentIdOrderByHoleNoAsc(card.getTournament().getId());
+        if (frozen.isEmpty() && !"开放".equals(hole.getStatus())) {
             throw new BizException("第 " + hole.getHoleNo() + " 洞当前为「" + hole.getStatus()
-                    + "」，非应打球洞，不能录入");
+                    + "」，非开放洞，不能录入；开赛后将以开赛时冻结的球洞为准");
         }
         ScorecardHole line = holeLineRepository.findByScorecardIdAndHoleNo(id, req.holeNo())
                 .orElseGet(() -> {
@@ -231,9 +238,9 @@ public class ScorecardService {
             throw new BizException("只有「进行中」的赛事可以提交记分卡，当前赛事状态：" + tournament.getStatus());
         }
 
-        List<Hole> open = openHoles();
+        List<PlayHole> open = expectedHoles(tournament);
         if (open.isEmpty()) {
-            throw new BizException("当前没有任何「开放」球洞，无法界定应打球洞，不能提交");
+            throw new BizException("当前赛事没有任何应打球洞（开赛冻结清单为空且球场无开放洞），不能提交");
         }
         List<ScorecardHole> lines = lines(id);
         Map<Integer, ScorecardHole> byNo = new HashMap<>();
@@ -245,24 +252,24 @@ public class ScorecardService {
         List<String> problems = new ArrayList<>();
         List<Snapshot.Hole> snapshotHoles = new ArrayList<>();
         int total = 0;
-        for (Hole hole : open) {
-            ScorecardHole line = byNo.get(hole.getHoleNo());
+        for (PlayHole hole : open) {
+            ScorecardHole line = byNo.get(hole.holeNo());
             if (line == null || line.getStrokes() == null) {
-                problems.add("第 " + hole.getHoleNo() + " 洞（par " + hole.getPar() + "）尚未录入杆数");
+                problems.add("第 " + hole.holeNo() + " 洞（par " + hole.par() + "）尚未录入杆数");
                 continue;
             }
             if (line.getStrokes() < Dict.MIN_STROKES) {
-                problems.add("第 " + hole.getHoleNo() + " 洞杆数非法（须 ≥ " + Dict.MIN_STROKES + "）");
+                problems.add("第 " + hole.holeNo() + " 洞杆数非法（须 ≥ " + Dict.MIN_STROKES + "）");
                 continue;
             }
             total += line.getStrokes();
-            snapshotHoles.add(new Snapshot.Hole(hole.getHoleNo(), hole.getPar(),
+            snapshotHoles.add(new Snapshot.Hole(hole.holeNo(), hole.par(),
                     line.getStrokes(), null, null, null));
         }
-        Set<Integer> openNos = open.stream().map(Hole::getHoleNo).collect(Collectors.toSet());
+        Set<Integer> openNos = open.stream().map(PlayHole::holeNo).collect(Collectors.toSet());
         for (ScorecardHole extra : lines) {
             if (!openNos.contains(extra.getHoleNo())) {
-                problems.add("第 " + extra.getHoleNo() + " 洞当前非开放洞，不属于应打球洞");
+                problems.add("第 " + extra.getHoleNo() + " 洞不属于本场赛事应打球洞");
             }
         }
         if (!problems.isEmpty()) {
@@ -546,10 +553,45 @@ public class ScorecardService {
                 .orElseThrow(() -> new BizException("球员不存在：" + playerId));
     }
 
-    private List<Hole> openHoles() {
-        return holeRepository.findByStatus("开放").stream()
+    /**
+     * 赛事的应打球洞口径（洞号 + 标准杆）：
+     * ① 已开赛 → 开赛瞬间冻结的本轮球洞（{@code tournament_round_hole}），
+     *    之后球洞被改为维护 / 封闭不影响本轮记分；
+     * ② 报名中且绑定球场 → 该球场当前开放洞（草稿预览口径）；
+     * ③ 旧赛事未绑定球场 / 无冻结清单 → 兼容历史口径：全部当前开放洞。
+     */
+    private List<PlayHole> expectedHoles(Tournament tournament) {
+        List<TournamentRoundHole> frozen =
+                roundHoleRepository.findByTournamentIdOrderByHoleNoAsc(tournament.getId());
+        if (!frozen.isEmpty()) {
+            return frozen.stream()
+                    .map(rh -> new PlayHole(rh.getHoleNo(), rh.getPar()))
+                    .toList();
+        }
+        Long courseId = tournament.getCourse() == null ? null : tournament.getCourse().getId();
+        List<Hole> holes = courseId == null
+                ? holeRepository.findByStatus("开放")
+                : holeRepository.findByCourseIdOrderByHoleNoAsc(courseId).stream()
+                        .filter(h -> "开放".equals(h.getStatus())).toList();
+        return holes.stream()
                 .sorted(Comparator.comparing(Hole::getHoleNo))
+                .map(h -> new PlayHole(h.getHoleNo(), h.getPar()))
                 .toList();
+    }
+
+    /** 按赛事球场定位指定洞号（不同球场洞号会重复，不能用全局 findByHoleNo）。 */
+    private Hole resolveTournamentHole(Tournament tournament, Integer holeNo) {
+        if (tournament.getCourse() == null) {
+            return holeRepository.findByHoleNo(holeNo)
+                    .orElseThrow(() -> new BizException("球洞不存在：第 " + holeNo + " 洞"));
+        }
+        return holeRepository.findByCourseIdAndHoleNo(tournament.getCourse().getId(), holeNo)
+                .orElseThrow(() -> new BizException("赛事「" + tournament.getName() + "」绑定球场「"
+                        + tournament.getCourse().getName() + "」下不存在第 " + holeNo + " 洞"));
+    }
+
+    /** 记分卡口径下的应打洞（洞号 + 冻结 / 实时标准杆）。 */
+    private record PlayHole(Integer holeNo, Integer par) {
     }
 
     /** 球员姓名必须与卡面球员一致（本系统无登录态，以显式姓名做最小归属校验）。 */

@@ -17,20 +17,24 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class GlobalExceptionHandler {
 
     /**
-     * 业务校验失败：400 + 中文业务提示
+     * 业务校验失败：400 + 中文业务提示。
+     * 开赛校验失败额外把结构化的逐洞阻止明细放进 data，前端直接渲染受影响洞号 / 状态 / 修复提示。
      */
     @ExceptionHandler(BizException.class)
-    public ResponseEntity<ApiResponse<Void>> handleBiz(BizException e) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiResponse.fail(e.getMessage()));
+    public ResponseEntity<ApiResponse<Object>> handleBiz(BizException e) {
+        Object data = (e instanceof StartBlockedException sb) ? sb.checkView() : null;
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse<>(false, e.getMessage(), data));
     }
 
     /**
      * 并发冲突（页面版本过期）：409。前端必须明确提示「数据已变化」并展示当前状态，
-     * 不能让后到的写静默覆盖先到者的结果。
+     * 不能让后到的写静默覆盖先到者的结果。冲突响应带当前最新状态视图时放进 data（如最新赛事 + 球洞状态）。
      */
     @ExceptionHandler(ConflictException.class)
-    public ResponseEntity<ApiResponse<Void>> handleConflict(ConflictException e) {
-        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(e.getMessage()));
+    public ResponseEntity<ApiResponse<Object>> handleConflict(ConflictException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false, e.getMessage(), e.getData()));
     }
 
     /**

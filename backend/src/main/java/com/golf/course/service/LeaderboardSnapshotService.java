@@ -29,12 +29,14 @@ import com.golf.course.entity.LeaderboardSnapshot;
 import com.golf.course.entity.Player;
 import com.golf.course.entity.Tournament;
 import com.golf.course.entity.TournamentEntry;
+import com.golf.course.entity.TournamentRoundHole;
 import com.golf.course.repository.HoleRepository;
 import com.golf.course.repository.LeaderboardSnapshotRepository;
 import com.golf.course.repository.PlayerRepository;
 import com.golf.course.repository.ScoreRepository;
 import com.golf.course.repository.TournamentEntryRepository;
 import com.golf.course.repository.TournamentRepository;
+import com.golf.course.repository.TournamentRoundHoleRepository;
 
 /**
  * 赛事排行榜快照业务：收口前后的数据边界、失败回滚与并发覆盖的统一落点。
@@ -63,6 +65,7 @@ public class LeaderboardSnapshotService {
     private final PlayerRepository playerRepository;
     private final HoleRepository holeRepository;
     private final LeaderboardSnapshotRepository snapshotRepository;
+    private final TournamentRoundHoleRepository roundHoleRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
 
@@ -72,6 +75,7 @@ public class LeaderboardSnapshotService {
                                       PlayerRepository playerRepository,
                                       HoleRepository holeRepository,
                                       LeaderboardSnapshotRepository snapshotRepository,
+                                      TournamentRoundHoleRepository roundHoleRepository,
                                       ObjectMapper objectMapper,
                                       PlatformTransactionManager transactionManager) {
         this.tournamentRepository = tournamentRepository;
@@ -80,6 +84,7 @@ public class LeaderboardSnapshotService {
         this.playerRepository = playerRepository;
         this.holeRepository = holeRepository;
         this.snapshotRepository = snapshotRepository;
+        this.roundHoleRepository = roundHoleRepository;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -259,13 +264,25 @@ public class LeaderboardSnapshotService {
      */
     private Computation compute(Tournament tournament) {
         Long tid = tournament.getId();
-        List<Hole> openHoles = holeRepository.findByStatus("开放").stream()
-                .sorted(Comparator.comparing(Hole::getHoleNo))
-                .toList();
-        List<Integer> holeNos = openHoles.stream().map(Hole::getHoleNo).toList();
+        // 应打球洞口径：
+        //  ① 已开赛（进行中 / 已结束）→ 开赛瞬间冻结的本轮球洞清单，之后维护 / 封闭洞不影响本轮；
+        //  ② 报名中且绑定球场 → 按球场当前「开放」洞做开赛前景预览（与开赛校验同一批洞）；
+        //  ③ 旧赛事（无绑定球场 / 无冻结清单）→ 兼容历史口径：全部当前开放洞。
+        List<TournamentRoundHole> frozen = roundHoleRepository.findByTournamentIdOrderByHoleNoAsc(tid);
+        boolean frozenRound = !frozen.isEmpty();
+        List<EffectiveHole> effectiveOpenHoles = frozenRound
+                ? frozen.stream()
+                        .map(rh -> new EffectiveHole(rh.getHole() == null ? null : rh.getHole().getId(),
+                                rh.getHoleNo(), rh.getPar(), true))
+                        .toList()
+                : loadPreviewOpenHoles(tournament);
+        List<Integer> holeNos = effectiveOpenHoles.stream().map(EffectiveHole::holeNo).toList();
         Map<Long, Hole> holesById = holeRepository.findAll().stream()
                 .collect(Collectors.toMap(Hole::getId, Function.identity(), (a, b) -> a));
-        Map<Long, Player> playersById = playerRepository.findAll().stream()
+        Map<Integer, EffectiveHole> openByNo = effectiveOpenHoles.stream()
+                .collect(Collectors.toMap(EffectiveHole::holeNo, Function.identity(), (a, b) -> a));
+        List<Player> players = playerRepository.findAll();
+        Map<Long, Player> playersById = players.stream()
                 .collect(Collectors.toMap(Player::getId, Function.identity(), (a, b) -> a));
         List<TournamentEntry> entries = entryRepository.findByTournamentIdOrderByIdAsc(tid);
 
@@ -274,8 +291,10 @@ public class LeaderboardSnapshotService {
         if (entries.isEmpty()) {
             violations.add(tLabel + "没有任何参赛球员，无法生成正式排行榜");
         }
-        if (openHoles.isEmpty()) {
-            violations.add(tLabel + "当前没有任何「开放」球洞，无法界定应打洞数，无法生成正式排行榜");
+        if (effectiveOpenHoles.isEmpty()) {
+            violations.add(tLabel + (frozenRound
+                    ? "本轮冻结球洞清单为空，无法界定应打洞数，无法生成正式排行榜"
+                    : "当前没有任何可打「开放」球洞，无法界定应打洞数，无法生成正式排行榜"));
         }
 
         // 球员 → （轮次 → （洞号 → 杆数)），只收集「球员与洞都存在」的成绩；
@@ -338,10 +357,19 @@ public class LeaderboardSnapshotService {
                         + row.getRoundNo() + " 轮" + holeLabel + "成绩，轮次越界");
                 continue;
             }
-            if (!"开放".equals(hole.getStatus())) {
-                violations.add(tLabel + pLabel + "第 " + row.getRoundNo() + " 轮" + holeLabel
-                        + "当前为「" + hole.getStatus() + "」非应打球洞，其成绩（" + row.getStrokes()
-                        + " 杆）不能计入正式排行榜");
+            // 应打洞判定：已开赛以冻结清单为准（洞后来改维护 / 封闭也不踢出本轮成绩）；
+            // 报名中预览则要求该洞此刻仍开放且属于绑定球场。
+            EffectiveHole effective = openByNo.get(hole.getHoleNo());
+            boolean belongsToRound = frozenRound
+                    ? effective != null
+                    : effective != null && "开放".equals(hole.getStatus());
+            if (!belongsToRound) {
+                String scope = frozenRound
+                        ? "不属于开赛时冻结的本轮应打球洞"
+                        : "当前为「" + hole.getStatus() + "」非应打球洞（或不属于绑定球场）";
+                violations.add(tLabel + pLabel + "第 " + row.getRoundNo()
+                        + " 轮" + holeLabel + "成绩（" + row.getStrokes() + " 杆）" + scope
+                        + "，不能计入正式排行榜");
                 continue;
             }
             if (row.getStrokes() == null || row.getStrokes() < Dict.MIN_STROKES) {
@@ -372,7 +400,7 @@ public class LeaderboardSnapshotService {
             Map<Integer, Map<Integer, Integer>> byRound =
                     valid.getOrDefault(player.getId(), Map.of());
             List<LeaderboardView.Round> rounds = new ArrayList<>();
-            boolean rowComplete = !openHoles.isEmpty();
+            boolean rowComplete = !effectiveOpenHoles.isEmpty();
             int totalStrokes = 0;
             int totalPar = 0;
             for (int round = 1; round <= entry.getRoundCount(); round++) {
@@ -381,15 +409,15 @@ public class LeaderboardSnapshotService {
                 Map<Integer, Integer> strokesByHole = new LinkedHashMap<>();
                 int roundStrokes = 0;
                 int roundPar = 0;
-                for (Hole hole : openHoles) {
+                for (EffectiveHole hole : effectiveOpenHoles) {
                     // par 无论是否已录入都计入总标准杆（缺洞只缺杆数，不缺标准杆口径）
-                    roundPar += hole.getPar();
-                    Integer strokes = byHole.get(hole.getHoleNo());
+                    roundPar += hole.par();
+                    Integer strokes = byHole.get(hole.holeNo());
                     if (strokes == null) {
-                        missing.add(hole.getHoleNo());
+                        missing.add(hole.holeNo());
                         rowComplete = false;
                     } else {
-                        strokesByHole.put(hole.getHoleNo(), strokes);
+                        strokesByHole.put(hole.holeNo(), strokes);
                         roundStrokes += strokes;
                     }
                 }
@@ -418,6 +446,27 @@ public class LeaderboardSnapshotService {
 
     private String holeLabel(Hole hole, Long holeId) {
         return hole == null ? "不存在洞（holeId=" + holeId + "）" : String.valueOf(hole.getHoleNo());
+    }
+
+    /**
+     * 报名中（未开赛）赛事的应打洞预览口径：
+     * 绑定了球场 → 只取该球场当前开放洞（与开赛校验同一批数据，页面所见即开赛所校验）；
+     * 旧赛事未绑定球场 → 兼容历史口径，取全部开放洞。
+     */
+    private List<EffectiveHole> loadPreviewOpenHoles(Tournament tournament) {
+        Long courseId = tournament.getCourse() == null ? null : tournament.getCourse().getId();
+        List<Hole> holes = courseId == null
+                ? holeRepository.findByStatus("开放")
+                : holeRepository.findByCourseIdOrderByHoleNoAsc(courseId).stream()
+                        .filter(h -> "开放".equals(h.getStatus())).toList();
+        return holes.stream()
+                .sorted(Comparator.comparing(Hole::getHoleNo))
+                .map(h -> new EffectiveHole(h.getId(), h.getHoleNo(), h.getPar(), false))
+                .toList();
+    }
+
+    /** 应打球洞的统一口径（冻结洞或实时洞共用），避免排行榜代码再回查 hole 表状态。 */
+    private record EffectiveHole(Long holeId, Integer holeNo, Integer par, boolean frozen) {
     }
 
     /** 统一组装：排名计算 + 视图构造（临时 / 正式 / 失败 / 历史四种 kind 共用）。 */

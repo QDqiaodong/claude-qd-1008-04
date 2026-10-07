@@ -18,6 +18,17 @@ public final class Dict {
     /** 开放 → 维护 → 开放；封闭为人工停用终态，可从维护进入 */
     public static final List<String> HOLE_STATUSES = List.of("开放", "维护", "封闭");
 
+    /** 标准杆只接受 3 / 4 / 5 */
+    public static final List<Integer> HOLE_PARS = List.of(3, 4, 5);
+
+    /** 码距合法区间（码）：大于 0 且不超过锦标场长度上限 */
+    public static final int YARDAGE_MIN = 1;
+    public static final int YARDAGE_MAX = 800;
+
+    /** 单场球场洞数合法区间（9 洞场 / 18 洞场均在此范围内） */
+    public static final int COURSE_HOLE_MIN = 1;
+    public static final int COURSE_HOLE_MAX = 18;
+
     // ---------------- 开球时间状态 ----------------
     public static final List<String> TEE_STATUSES = List.of("可订", "已订");
 
@@ -79,6 +90,21 @@ public final class Dict {
 
     public static boolean isValidHoleStatus(String status) {
         return status != null && HOLE_STATUSES.contains(status);
+    }
+
+    /** 标准杆只接受 3 / 4 / 5（开赛校验口径：基础数据不完整也阻止开赛） */
+    public static boolean isValidPar(Integer par) {
+        return par != null && HOLE_PARS.contains(par);
+    }
+
+    /** 码距须为 1 ~ 800 的整数 */
+    public static boolean isValidYardage(Integer yardage) {
+        return yardage != null && yardage >= YARDAGE_MIN && yardage <= YARDAGE_MAX;
+    }
+
+    /** 球场应配置洞数须落在 1 ~ 18 */
+    public static boolean isValidCourseHoleCount(Integer holeCount) {
+        return holeCount != null && holeCount >= COURSE_HOLE_MIN && holeCount <= COURSE_HOLE_MAX;
     }
 
     public static boolean isValidTeeStatus(String status) {

@@ -1,0 +1,67 @@
+-- 赛事开赛前球场可用性校验 · 端到端手工验证脚本（按顺序执行）
+-- 前置：./start.sh 起服务（MySQL 镜像构建期已导入种子数据）。
+-- 种子：赛事 1「金秋会员邀请赛」绑定 A场(id=1)，第 5 洞维护、第 9 洞封闭 → 开赛被阻止；
+--       赛事 2 绑定练习场(id=3)，第 5 洞维护、第 9 洞未建档；
+--       赛事 7「十月开场杯」绑定锦标场(id=4)，9 洞全部开放 → 可直接开赛。
+
+-- ===== A. 只读校验：实时读最新球洞版本（绝不复用旧结果） =====
+GET /api/courses
+GET /api/holes?courseId=1
+-- A1. 被阻止：state=已阻止，blockedHoles 两条（5 维护 / 9 封闭），每条带洞号、状态、修复提示
+GET /api/tournaments/1/start-check
+-- A2. 练习场：5 维护 + 9 未配置（status=未配置，fixHint 提示新建第 9 洞）
+GET /api/tournaments/2/start-check
+-- A3. 可开赛：state=可开赛，readyHoleNos=1..9，返回赛事 version 与球洞版本指纹 holeVersionToken
+GET /api/tournaments/7/start-check
+
+-- ===== B. 开赛失败：400 + 逐洞明细；赛事仍报名中、名单 / 草稿保留、无半进行中 =====
+-- 预期 400，响应体 data 与 start-check 一致（state=已阻止，blockedHoles 两条）
+POST /api/tournaments/1/advance?target=进行中
+-- 失败后复查：状态仍是「报名中」，无冻结洞
+GET /api/tournaments/1
+GET /api/tournaments/1/start-check
+
+-- ===== C. 修复球洞后重试：必须按最新洞版本成功，不能复用旧失败结果 =====
+-- 把第 5 洞(id=5)改回开放（携带洞版本 0；并发维护同一洞时过期版本 → 409）
+POST /api/holes/5/status?target=开放&expectedVersion=0
+-- 第 9 洞当前封闭，先开放（注意：种子球场配置为 9 洞，必须也放行才能开赛）
+POST /api/holes/9/status?target=开放&expectedVersion=0
+-- 重新校验：state=可开赛，holeVersionToken 已变化
+GET /api/tournaments/1/start-check
+-- 开赛成功：200，status=进行中；同一事务写入 9 行 tournament_round_hole 冻结清单
+POST /api/tournaments/1/advance?target=进行中
+-- 再次开始 → 409「已被其他人开始」，data.state=已开始（返回当前赛事与球洞状态）
+POST /api/tournaments/1/advance?target=进行中
+
+-- ===== D. 开赛后维护球洞不改变本轮；新赛事必须重新校验 =====
+-- 开赛后再把第 5 洞改为维护：本轮冻结清单不变，start-check 仍是「已开始」、readyHoleNos 仍 1..9
+POST /api/holes/5/status?target=维护&expectedVersion=1
+GET /api/tournaments/1/start-check
+-- 排行榜临时口径仍按开赛冻结的 9 洞计算（第 5 洞成绩仍计入本轮）
+GET /api/tournaments/1/leaderboard
+
+-- ===== E. 并发 / 版本冲突：只允许一个操作按最新版本成功 =====
+-- E1. 赛事 7 两人同时开始（预期一个 200，其余 409，冻结清单只有 9 行）
+POST /api/tournaments/7/advance?target=进行中
+POST /api/tournaments/7/advance?target=进行中
+-- E2. 携带过期赛事版本 → 409，data 为最新 StartCheckView（含当前 tournamentVersion）
+POST /api/tournaments/7/advance?target=进行中&expectedVersion=0
+-- E3. 页面打开后球洞被维护：携带旧 holeVersionToken → 409「球洞数据已变化」
+GET /api/tournaments/2/start-check
+-- POST /api/tournaments/2/advance?target=进行中&expectedHoleVersion=<上一步返回的token>&expectedVersion=<赛事version>
+--   （期间先调用 POST /api/holes/23/status?target=开放 再发起，即得到 409）
+
+-- ===== F. 球场与洞维护 =====
+POST /api/courses
+Content-Type: application/json
+
+{"courseNo":"C-NEW","name":"新球场","holeCount":9,"note":"开赛前逐洞校验"}
+POST /api/holes
+Content-Type: application/json
+
+{"course":{"id":5},"holeNo":1,"par":4,"yardage":420,"status":"开放"}
+-- 洞基础数据非法 → 400（par 仅 3/4/5；yardage 1~800）
+POST /api/holes
+Content-Type: application/json
+
+{"course":{"id":5},"holeNo":2,"par":6,"yardage":0,"status":"开放"}
