@@ -4,12 +4,16 @@ const http = axios.create({ baseURL: '/api', timeout: 20000 })
 
 // 后端统一返回 {ok, message, data}；HTTP 400 的业务异常也要把中文提示带出来。
 // 409 表示并发版本冲突：标记 isConflict，供页面弹「数据已变化」并强制刷新。
+// 开赛校验的 400（被球洞阻止）/ 409（版本过期）响应体 data 带按最新状态重算的校验视图，
+// 挂到 e.data 上，页面无需再次请求即可渲染受影响洞号 / 当前状态 / 修复提示。
 http.interceptors.response.use(
   (response) => response,
   (error) => {
+    const status = error?.response?.status
     const message = error?.response?.data?.message || error?.message || '请求失败'
     const e = new Error(message)
-    e.isConflict = error?.response?.status === 409
+    e.isConflict = status === 409
+    e.data = error?.response?.data?.data || null
     return Promise.reject(e)
   }
 )
@@ -26,12 +30,20 @@ async function call(promise) {
 const params = (o) => ({ params: o })
 
 export default {
+  // ---------------- 球场 ----------------
+  listCourses: () => call(http.get('/courses')),
+  getCourse: (id) => call(http.get(`/courses/${id}`)),
+  createCourse: (d) => call(http.post('/courses', d)),
+  updateCourse: (id, d) => call(http.put(`/courses/${id}`, d)),
+
   // ---------------- 球洞 ----------------
   listHoles: (p) => call(http.get('/holes', params(p || {}))),
   getHole: (id) => call(http.get(`/holes/${id}`)),
   createHole: (d) => call(http.post('/holes', d)),
   updateHole: (id, d) => call(http.put(`/holes/${id}`, d)),
-  setHoleStatus: (id, target) => call(http.post(`/holes/${id}/status`, null, params({ target }))),
+  setHoleStatus: (id, target, expectedVersion) =>
+    call(http.post(`/holes/${id}/status`, null,
+      params({ target, ...(expectedVersion != null ? { expectedVersion } : {}) }))),
 
   // ---------------- 球员 ----------------
   listPlayers: () => call(http.get('/players')),
@@ -54,6 +66,14 @@ export default {
   advanceTournament: (id, target, expectedVersion) =>
     call(http.post(`/tournaments/${id}/advance`, null,
       params({ target, ...(expectedVersion != null ? { expectedVersion } : {}) }))),
+
+  // ---------------- 赛事开赛前球场可用性校验 ----------------
+  // GET：永远按最新球洞版本实时重算（可开赛 / 被阻止 / 已开始），只读不留痕；
+  // POST start：按最新版本开赛，400 带阻断明细视图、409 带当前赛事与球洞状态。
+  getTournamentStartCheck: (id) => call(http.get(`/tournaments/${id}/start-check`)),
+  startTournament: (id, expectedVersion) =>
+    call(http.post(`/tournaments/${id}/start`, null,
+      params({ ...(expectedVersion != null ? { expectedVersion } : {}) }))),
 
   // ---------------- 赛事排行榜快照（临时结果 / 正式快照 / 收口失败原因） ----------------
   // 同一接口按赛事状态返回不同口径：报名中/进行中=临时结果；已结束=冻结正式快照；

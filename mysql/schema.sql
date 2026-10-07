@@ -24,6 +24,7 @@ DROP TABLE IF EXISTS scorecard_event;
 DROP TABLE IF EXISTS scorecard_hole;
 DROP TABLE IF EXISTS scorecard;
 DROP TABLE IF EXISTS tournament_entry;
+DROP TABLE IF EXISTS tournament_start_check;
 DROP TABLE IF EXISTS score;
 DROP TABLE IF EXISTS leaderboard_snapshot;
 DROP TABLE IF EXISTS leaderboard;
@@ -31,17 +32,39 @@ DROP TABLE IF EXISTS tee_time;
 DROP TABLE IF EXISTS tournament;
 DROP TABLE IF EXISTS player;
 DROP TABLE IF EXISTS hole;
+DROP TABLE IF EXISTS course;
 SET FOREIGN_KEY_CHECKS = 1;
 
+-- ---------------- 球场 ----------------
+-- 赛事绑定的「球场」：开赛校验、应打球洞集合都按球场隔离（同一洞号可分属不同球场）。
+-- hole_count 为该球场本场赛事应打的连续洞号数（应打洞号 = 1 ~ hole_count），
+-- 合法区间 1 ~ 18；未配置齐的洞号在开赛校验中按「未配置」阻断。
+CREATE TABLE course (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    course_no VARCHAR(24) NOT NULL UNIQUE,
+    name VARCHAR(48) NOT NULL,
+    hole_count INT NOT NULL,
+    note VARCHAR(255),
+    created_at DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------- 球洞 ----------------
--- 状态：开放 / 维护 / 封闭；par 取 3 / 4 / 5
+-- 球洞归属于某个球场：(球场, 洞号) 唯一。
+-- 状态：开放 / 维护 / 封闭；par 取 3 / 4 / 5；yardage 须 > 0。
+-- version 为 JPA @Version 乐观锁：多人同时维护同一球洞时只有基于最新版本的一次成功，
+-- 过期操作 409；开赛校验由赛事行悲观锁串行化、在锁内重新读取最新球洞版本，
+-- 绝不复用任何一次旧校验结果。
 CREATE TABLE hole (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    hole_no INT NOT NULL UNIQUE,
+    course_id BIGINT NOT NULL,
+    hole_no INT NOT NULL,
     par INT NOT NULL,
     yardage INT NOT NULL,
     status VARCHAR(16) NOT NULL,
-    created_at DATETIME
+    version BIGINT NOT NULL DEFAULT 0,
+    created_at DATETIME,
+    UNIQUE KEY uk_hole_course_no (course_id, hole_no),
+    KEY idx_hole_course (course_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 球员 ----------------
@@ -76,12 +99,14 @@ CREATE TABLE tee_time (
 
 -- ---------------- 赛事 ----------------
 -- 状态：报名中 → 进行中 → 已结束
+-- course_id 绑定赛事所用球场（开赛前必须绑定；开赛后冻结，不允许换场）；
 -- course_rating / slope_rating 为球场难度参数（差点差值计算的输入），需成对维护；
 -- 旧赛事允许为 NULL —— 涉及这些赛事的轮次在差点计算中会被明确标记为「缺球场难度参数」并排除。
 CREATE TABLE tournament (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     tournament_no VARCHAR(24) NOT NULL UNIQUE,
     name VARCHAR(64) NOT NULL,
+    course_id BIGINT,
     start_date DATE,
     end_date DATE,
     status VARCHAR(16) NOT NULL,
@@ -90,9 +115,10 @@ CREATE TABLE tournament (
     slope_rating INT,
     note VARCHAR(64),
     created_at DATETIME,
-    -- 赛事乐观锁版本号：多人并发推进收口（生成正式快照）时，只有基于最新版本的一次成功。
+    -- 赛事乐观锁版本号：多人并发推进（开赛校验 / 生成正式快照）时，只有基于最新版本的一次成功。
     version BIGINT NOT NULL DEFAULT 0,
-    KEY idx_tour_end_date (end_date)
+    KEY idx_tour_end_date (end_date),
+    KEY idx_tour_course (course_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 赛事排行榜（乐观锁演示实体） ----------------
@@ -128,6 +154,30 @@ CREATE TABLE leaderboard_snapshot (
     version BIGINT NOT NULL DEFAULT 0,
     updated_at DATETIME,
     UNIQUE KEY uk_snapshot_tournament (tournament_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------- 赛事开赛前球场可用性校验 ----------------
+-- 一场赛事至多一行（uk_start_check_tournament 兜底），由「开始（报名中 → 进行中）」专用事务维护：
+--   可开赛 = 校验通过且赛事已翻为「进行中」：eligible_hole_nos 冻结本次应打球洞清单
+--            （之后有人把球洞改成维护 / 封闭，本轮仍按冻结洞集进行，不静默改变本轮状态）；
+--   被阻止 = 最近一次开赛尝试校验失败：赛事事务整体回滚仍保持「报名中」（不留下半个进行中状态，
+--            报名名单与成绩草稿原样保留），blocked_holes_json 记录受影响洞号 / 当前状态 / 修复提示；
+--            每次重试都在赛事行悲观锁内重新读取最新球洞版本后整行覆盖，绝不复用旧结果。
+-- 纯查询（GET 开赛校验接口）永远实时重算，不读写本表——它只用于冻结 / 留痕与失败恢复。
+-- check_type：可开赛 / 被阻止；course_version_hash 为校验时全部球洞版本指纹。
+CREATE TABLE tournament_start_check (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    tournament_id BIGINT NOT NULL,
+    check_type VARCHAR(16) NOT NULL,
+    course_id BIGINT,
+    eligible_hole_nos VARCHAR(255),
+    blocked_holes_json MEDIUMTEXT,
+    course_version_hash BIGINT,
+    checked_at DATETIME,
+    updated_at DATETIME,
+    version BIGINT NOT NULL DEFAULT 0,
+    UNIQUE KEY uk_start_check_tournament (tournament_id),
+    KEY idx_start_check_course (course_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 成绩（按洞录入） ----------------
@@ -328,16 +378,32 @@ CREATE TABLE handicap_history_round (
 -- 种子数据
 -- =====================================================================
 
-INSERT INTO hole (id, hole_no, par, yardage, status, created_at) VALUES
-(1, 1, 4, 412, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(2, 2, 5, 528, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(3, 3, 3, 168, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(4, 4, 4, 395, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(5, 5, 4, 430, '维护', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(6, 6, 3, 190, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(7, 7, 5, 545, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(8, 8, 4, 408, '开放', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(9, 9, 3, 205, '封闭', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY);
+INSERT INTO course (id, course_no, name, hole_count, note, created_at) VALUES
+(1, 'C-A', 'A场主球场', 9, '9 洞场：第 5 洞维护、第 9 洞封闭，直接演示开赛被阻止与修复后重试',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(2, 'C-B', 'B场老球场', 9, '历史赛事使用的 9 洞场，当前全部开放',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY);
+
+INSERT INTO hole (id, course_id, hole_no, par, yardage, status, version, created_at) VALUES
+(1, 1, 1, 4, 412, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(2, 1, 2, 5, 528, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(3, 1, 3, 3, 168, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(4, 1, 4, 4, 395, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(5, 1, 5, 4, 430, '维护', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(6, 1, 6, 3, 190, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(7, 1, 7, 5, 545, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(8, 1, 8, 4, 408, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(9, 1, 9, 3, 205, '封闭', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+-- B 场：9 洞全部开放（供历史已结束赛事 / 新赛事绑定）
+(10, 2, 1, 4, 401, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(11, 2, 2, 5, 512, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(12, 2, 3, 3, 175, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(13, 2, 4, 4, 388, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(14, 2, 5, 4, 421, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(15, 2, 6, 3, 183, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(16, 2, 7, 5, 532, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(17, 2, 8, 4, 399, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(18, 2, 9, 4, 415, '开放', 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY);
 
 INSERT INTO player (id, player_no, name, handicap, phone, note, created_at) VALUES
 (1,  'P-001', '林浩',     12, '13801012001', '单差点进阶',     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 50 DAY),
@@ -363,14 +429,16 @@ INSERT INTO tee_time (id, play_date, player_id, slot, status, note, created_at) 
 (9,  '2026-10-03', 9,  '10:10', '可订', '待拼场',         UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 4 DAY),
 (10, '2026-10-03', 10, '15:00', '已订', '新人练习',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 4 DAY);
 
-INSERT INTO tournament (id, tournament_no, name, start_date, end_date, status, location, course_rating, slope_rating, note, created_at) VALUES
-(1, 'T-2026-001', '金秋会员邀请赛', '2026-10-10', '2026-10-12', '报名中', 'A场主球场', 28.8, 116, '9 洞比杆赛',   UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 30 DAY),
-(2, 'T-2026-002', '青少年高尔夫训练营', '2026-11-01', '2026-11-03', '报名中', '练习场', NULL, NULL, '低差点组',     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 28 DAY),
+INSERT INTO tournament (id, tournament_no, name, course_id, start_date, end_date, status, location, course_rating, slope_rating, note, created_at) VALUES
+-- 赛事 1 绑定 A 场（9 洞，其中第 5 洞维护、第 9 洞封闭）：点「开始」必然被阻止，修复后可重试
+(1, 'T-2026-001', '金秋会员邀请赛', 1, '2026-10-10', '2026-10-12', '报名中', 'A场主球场', 28.8, 116, '9 洞比杆赛',   UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 30 DAY),
+-- 赛事 2 尚未绑定球场：开赛校验会按「基础数据不完整（未绑定球场）」阻止，绑定球场后再校验
+(2, 'T-2026-002', '青少年高尔夫训练营', NULL, '2026-11-01', '2026-11-03', '报名中', '练习场', NULL, NULL, '低差点组',     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 28 DAY),
 -- 历史已结束赛事（差点重算的轮次来源）；T-2026-005 为旧数据，未维护球场难度参数（演示缺参与定向重算）
-(3, 'T-2026-003', '春季会员杯', '2026-06-12', '2026-06-14', '已结束', 'A场主球场', 28.6, 118, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 120 DAY),
-(4, 'T-2026-004', '夏季公开赛', '2026-07-10', '2026-07-12', '已结束', 'A场主球场', 29.1, 122, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 92 DAY),
-(5, 'T-2026-005', '迎新友谊赛', '2026-08-07', '2026-08-09', '已结束', 'B场老球场', NULL, NULL, '旧数据：未维护球场难度参数', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 64 DAY),
-(6, 'T-2026-006', '秋季排位赛', '2026-09-04', '2026-09-06', '已结束', 'A场主球场', 28.3, 115, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 36 DAY);
+(3, 'T-2026-003', '春季会员杯', 1, '2026-06-12', '2026-06-14', '已结束', 'A场主球场', 28.6, 118, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 120 DAY),
+(4, 'T-2026-004', '夏季公开赛', 1, '2026-07-10', '2026-07-12', '已结束', 'A场主球场', 29.1, 122, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 92 DAY),
+(5, 'T-2026-005', '迎新友谊赛', 2, '2026-08-07', '2026-08-09', '已结束', 'B场老球场', NULL, NULL, '旧数据：未维护球场难度参数', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 64 DAY),
+(6, 'T-2026-006', '秋季排位赛', 1, '2026-09-04', '2026-09-06', '已结束', 'A场主球场', 28.3, 115, NULL,               UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 36 DAY);
 
 INSERT INTO leaderboard (id, tournament_id, round_no, leader_name, total_score, version, updated_at) VALUES
 (1, 1, 1, '王启明', 33, 0, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 DAY),
@@ -592,3 +660,17 @@ INSERT INTO handicap_rule
  '3:1,4:1,5:1,6:2,7:2,8:2,9:3,10:3,11:3,12:4,13:4,14:4,15:5,16:5,17:5,18:6,19:6,20:8',
  40.0, 5.0, '默认规则：最近20轮、样本≥3、按样本数取最低差值、单轮截断40、单次下调≤5',
  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 90 DAY);
+
+-- =====================================================================
+-- 种子数据：赛事开赛校验（演示「已开始」冻结口径）
+--   T-2026-007 已在 A 场 9 洞全部开放时开赛，冻结应打洞 1~9；
+--   之后即使把某洞改成维护 / 封闭，本轮状态与洞集都不变（后续新赛事须重新校验）。
+-- =====================================================================
+INSERT INTO tournament (id, tournament_no, name, course_id, start_date, end_date, status, location, course_rating, slope_rating, note, created_at) VALUES
+(7, 'T-2026-007', '开场热身赛', 1, '2026-10-05', '2026-10-05', '进行中', 'A场主球场', 28.8, 116, '已开赛：冻结 9 洞，后续改维护不影响本轮',
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 DAY);
+
+INSERT INTO tournament_start_check
+(id, tournament_id, check_type, course_id, eligible_hole_nos, blocked_holes_json, course_version_hash, checked_at, updated_at, version) VALUES
+(1, 7, '可开赛', 1, '1,2,3,4,5,6,7,8,9', NULL, NULL,
+ UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 DAY, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 2 DAY, 1);

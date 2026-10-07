@@ -5,9 +5,14 @@ import api from '../api'
 const tournaments = ref([])
 const players = ref([])
 const holes = ref([])
+const courses = ref([])
 
 const leaderboard = ref(null)
 const scores = ref([])
+// 开赛前球场可用性校验视图（校验中 / 可开赛 / 被阻止 / 已开始 四态）
+const startCheck = ref(null)
+const checking = ref(false)
+const starting = ref(false)
 const error = ref('')
 const tip = ref('')
 const loading = ref(false)
@@ -20,7 +25,7 @@ const tourDialog = ref(false)
 const savingTour = ref(false)
 const tourForm = ref(blankTour())
 function blankTour() {
-  return { tournamentNo: '', name: '', startDate: '2026-10-10', endDate: '2026-10-12', status: '报名中', location: '', courseRating: null, slopeRating: null, note: '' }
+  return { tournamentNo: '', name: '', courseId: null, startDate: '2026-10-10', endDate: '2026-10-12', status: '报名中', location: '', courseRating: null, slopeRating: null, note: '' }
 }
 
 // ---- 赛事编辑（含球场难度参数补齐） ----
@@ -29,7 +34,8 @@ const savingEdit = ref(false)
 const editForm = ref({})
 function openEdit(t) {
   editForm.value = {
-    id: t.id, name: t.name, startDate: t.startDate, endDate: t.endDate,
+    id: t.id, name: t.name, courseId: t.course?.id ?? null,
+    startDate: t.startDate, endDate: t.endDate,
     location: t.location, courseRating: t.courseRating, slopeRating: t.slopeRating, note: t.note
   }
   editDialog.value = true; error.value = ''; tip.value = ''
@@ -39,6 +45,7 @@ async function saveEdit() {
   try {
     const d = {
       ...editForm.value,
+      course: editForm.value.courseId ? { id: Number(editForm.value.courseId) } : null,
       courseRating: editForm.value.courseRating === '' || editForm.value.courseRating == null ? null : Number(editForm.value.courseRating),
       slopeRating: editForm.value.slopeRating === '' || editForm.value.slopeRating == null ? null : Number(editForm.value.slopeRating)
     }
@@ -46,6 +53,7 @@ async function saveEdit() {
     tip.value = `赛事「${d.name}」已更新${d.courseRating != null ? '，球场难度参数已补齐，可到差点中心定向重算受影响球员' : ''}`
     editDialog.value = false
     await loadTournaments()
+    await loadStartCheck().catch(() => {})
   } catch (e) { error.value = e.message } finally { savingEdit.value = false }
 }
 
@@ -60,6 +68,12 @@ function blankScore() {
 const canStart = (t) => t && t.status === '报名中'
 const canEnd = (t) => t && t.status === '进行中'
 const selectedTour = computed(() => tournaments.value.find(t => t.id === selectedTourId.value) || null)
+// 录成绩时只列所选赛事绑定球场的球洞；未绑定球场的旧赛事回退展示全部球洞
+const scoreHoleOptions = computed(() => {
+  const cid = selectedTour.value?.course?.id
+  if (!cid) return holes.value
+  return holes.value.filter(h => h.course?.id === cid)
+})
 
 async function loadTournaments() {
   tournaments.value = (await api.listTournaments()) || []
@@ -78,11 +92,21 @@ async function loadScores() {
 }
 
 async function loadAll() {
-  await Promise.all([loadTournaments(), loadPlayers(), loadHoles()])
-  await Promise.all([loadLeaderboard(), loadScores()])
+  await Promise.all([loadTournaments(), loadPlayers(), loadHoles(), loadCourses()])
+  await Promise.all([loadStartCheck(), loadLeaderboard(), loadScores()])
 }
 async function loadPlayers() { players.value = (await api.listPlayers()) || [] }
 async function loadHoles() { holes.value = (await api.listHoles()) || [] }
+async function loadCourses() { courses.value = (await api.listCourses()) || [] }
+
+/**
+ * 读取开赛校验视图：后端永远按最新球洞版本实时重算（只读不留痕）。
+ * 校验中 / 可开赛 / 被阻止 / 已开始四态都来自这个视图。
+ */
+async function loadStartCheck() {
+  if (!selectedTourId.value) { startCheck.value = null; return }
+  startCheck.value = (await api.getTournamentStartCheck(selectedTourId.value)) || null
+}
 
 function openTour() { tourForm.value = blankTour(); tourDialog.value = true; error.value = ''; tip.value = '' }
 async function saveTour() {
@@ -90,6 +114,7 @@ async function saveTour() {
   try {
     const d = {
       ...tourForm.value,
+      course: tourForm.value.courseId ? { id: Number(tourForm.value.courseId) } : null,
       courseRating: tourForm.value.courseRating === '' || tourForm.value.courseRating == null ? null : Number(tourForm.value.courseRating),
       slopeRating: tourForm.value.slopeRating === '' || tourForm.value.slopeRating == null ? null : Number(tourForm.value.slopeRating)
     }
@@ -100,20 +125,38 @@ async function saveTour() {
 }
 
 /**
- * 推进赛事。开始（报名中 → 进行中）只翻状态；结束（进行中 → 已结束）即收口：
- * 后端在同一事务校验全部参赛成绩、冻结唯一正式快照。409（并发 / 版本过期）与 400
- * （收口校验失败）都会提示并按当前状态重新读取排行榜。
+ * 开赛（报名中 → 进行中）：走专用开赛接口，后端按最新球洞版本做球场可用性校验。
+ * 400（被球洞阻止）与 409（并发 / 版本过期）的响应体 data 都带按当前状态重算的校验视图，
+ * 直接替换面板展示受影响洞号 / 当前状态 / 修复提示；赛事仍报名中，名单与草稿不被清掉。
  */
-async function advance(t, target) {
+async function startTournament(t) {
+  starting.value = true; error.value = ''; tip.value = ''
+  checking.value = true
+  try {
+    const view = await api.startTournament(t.id, t.version)
+    startCheck.value = view
+    tip.value = '球场可用性校验通过，赛事已开赛：应打球洞集已冻结，之后球洞改为维护 / 封闭不影响本轮'
+    await loadTournaments()
+    await Promise.all([loadLeaderboard(), loadScores()])
+  } catch (e) {
+    if (e.data) startCheck.value = e.data
+    error.value = e.isConflict
+      ? `${e.message}（并发冲突，已按当前赛事与球洞状态刷新）`
+      : e.message
+    await loadTournaments()
+    await Promise.all([loadStartCheck().catch(() => {}), loadLeaderboard().catch(() => {})])
+  } finally { starting.value = false; checking.value = false }
+}
+
+/** 结束（进行中 → 已结束）即收口：后端在同一事务校验成绩、冻结唯一正式快照。 */
+async function finishTournament(t) {
   error.value = ''; tip.value = ''
   const version = t.version
   try {
-    await api.advanceTournament(t.id, target, version)
-    tip.value = target === '已结束'
-      ? '赛事已收口：正式排行榜快照已生成并冻结，之后补录 / 修改 / 删除成绩都不会再改变名次'
-      : `赛事已推进至「${target}」`
+    await api.advanceTournament(t.id, '已结束', version)
+    tip.value = '赛事已收口：正式排行榜快照已生成并冻结，之后补录 / 修改 / 删除成绩都不会再改变名次'
     await loadTournaments()
-    await Promise.all([loadLeaderboard(), loadScores()])
+    await Promise.all([loadStartCheck(), loadLeaderboard(), loadScores()])
   } catch (e) {
     error.value = e.isConflict
       ? `${e.message}（并发冲突，页面已按当前状态刷新）`
@@ -122,6 +165,23 @@ async function advance(t, target) {
     // 收口失败时后端会留下「生成失败」原因，读取排行榜即可展示具体赛事 / 球员 / 洞号
     await loadLeaderboard().catch(() => {})
   }
+}
+
+/** 手动重新校验：管理员修复球洞后点击，强制读取最新球洞版本（绝不复用旧结果）。 */
+async function recheck() {
+  checking.value = true; error.value = ''
+  try {
+    await loadStartCheck()
+    tip.value = '已按最新球洞版本重新校验'
+  } catch (e) {
+    error.value = e.message
+  } finally { checking.value = false }
+}
+
+/** 兼容旧调用：表格行按钮按目标分流到开赛 / 收口。 */
+async function advance(t, target) {
+  if (target === '进行中') return startTournament(t)
+  return finishTournament(t)
 }
 
 /** 显式「收口并生成正式排名」按钮，与推进到已结束同一路径。 */
@@ -133,7 +193,7 @@ async function finalizeLeaderboard() {
     await api.finalizeTournamentLeaderboard(selectedTour.value.id, selectedTour.value.version)
     tip.value = '正式排行榜快照已生成并冻结，后续刷新只返回这份名次'
     await loadTournaments()
-    await Promise.all([loadLeaderboard(), loadScores()])
+    await Promise.all([loadStartCheck(), loadLeaderboard(), loadScores()])
   } catch (e) {
     error.value = e.isConflict ? `${e.message}（并发冲突）` : e.message
     await loadTournaments()
@@ -179,19 +239,37 @@ const lbTagType = (lb) => !lb ? 'info'
   : 'warning'
 const lbTagText = (lb) => lb ? lb.kind : ''
 
-// 自动刷新：只要选中赛事还在报名中 / 进行中，每 10 秒重读排行榜（临时结果随成绩变化）；
-// 已结束后冻结体不会变化，停止轮询，避免无意义请求。
+// 开赛校验四态徽标
+const checkTagType = (c) => !c ? 'info'
+  : c.phase === '已开始' ? 'success'
+  : c.phase === '可开赛' ? 'success'
+  : c.phase === '被阻止' ? 'danger'
+  : 'warning'
+const blockTagType = (s) => s === '开放' ? 'success'
+  : s === '维护' ? 'warning'
+  : s === '封闭' ? 'info'
+  : 'danger'
+
+// 自动刷新：选中赛事还在报名中时，每 8 秒重读开赛校验 + 排行榜——
+// 管理员在另一页面维护球洞后，本页面会把「可开赛 / 被阻止」结果刷新到最新版本；
+// 已开赛 / 已结束后开赛面板为冻结口径，停止对 start-check 的轮询（收口页仍按既有逻辑刷新排行榜）。
 let timer = null
 function syncAutoRefresh() {
   if (timer) { clearInterval(timer); timer = null }
   const t = selectedTour.value
-  if (t && t.status !== '已结束' && activeTab.value === 'leaderboard') {
+  if (!t) return
+  if (t.status === '报名中') {
+    timer = setInterval(() => {
+      loadStartCheck().catch(() => {})
+      if (activeTab.value === 'leaderboard') loadLeaderboard().catch(() => {})
+    }, 8000)
+  } else if (t.status !== '已结束' && activeTab.value === 'leaderboard') {
     timer = setInterval(() => { loadLeaderboard().catch(() => {}) }, 10000)
   }
 }
 
 watch(selectedTourId, async () => {
-  await Promise.all([loadLeaderboard(), loadScores()])
+  await Promise.all([loadStartCheck(), loadLeaderboard(), loadScores()])
   syncAutoRefresh()
 })
 watch(() => selectedTour.value?.status, syncAutoRefresh)
@@ -214,8 +292,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
       <el-tab-pane label="赛事" name="tournament">
         <div class="panel">
           <div class="panel-head">
-            <span class="panel-title">赛事 · 报名与推进</span>
-            <span class="panel-desc">状态只能逐级推进：报名中 → 进行中 → 已结束</span>
+            <span class="panel-title">赛事 · 报名与开赛校验</span>
+            <span class="panel-desc">状态只能逐级推进：报名中 →（球场可用性校验通过）进行中 → 已结束</span>
           </div>
           <div class="toolbar">
             <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
@@ -225,30 +303,123 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
             <el-button type="primary" @click="openTour">新建赛事</el-button>
           </div>
           <el-table :data="tournaments" v-loading="loading" border stripe>
-            <el-table-column prop="tournamentNo" label="编号" width="130" />
-            <el-table-column prop="name" label="名称" min-width="180" />
-            <el-table-column prop="startDate" label="开始" width="120" />
-            <el-table-column prop="endDate" label="结束" width="120" />
-            <el-table-column prop="status" label="状态" width="100">
+            <el-table-column prop="tournamentNo" label="编号" width="120" />
+            <el-table-column prop="name" label="名称" min-width="160" />
+            <el-table-column label="绑定球场" min-width="130">
+              <template #default="{ row }">
+                <span v-if="row.course">{{ row.course.name }}（{{ row.course.holeCount }}洞）</span>
+                <el-tag v-else type="danger" size="small">未绑定</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="startDate" label="开始" width="110" />
+            <el-table-column prop="endDate" label="结束" width="110" />
+            <el-table-column prop="status" label="状态" width="90">
               <template #default="{ row }">
                 <el-tag :type="row.status === '报名中' ? 'info' : row.status === '进行中' ? 'warning' : 'success'">{{ row.status }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="location" label="地点" width="120" />
-            <el-table-column label="难度参数" width="130">
-              <template #default="{ row }">
-                <span v-if="row.courseRating != null">{{ row.courseRating }} / {{ row.slopeRating }}</span>
-                <el-tag v-else type="danger" size="small">未维护</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="260" fixed="right">
+            <el-table-column prop="version" label="版本" width="60" />
+            <el-table-column label="操作" width="250" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" type="primary" plain @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" type="warning" plain :disabled="!canStart(row)" @click="advance(row, '进行中')">开始</el-button>
-                <el-button size="small" type="success" plain :disabled="!canEnd(row)" @click="advance(row, '已结束')">结束</el-button>
+                <el-button size="small" type="warning" plain :loading="starting && selectedTourId === row.id"
+                           :disabled="!canStart(row)" @click="startTournament(row)">开始</el-button>
+                <el-button size="small" type="success" plain :disabled="!canEnd(row)" @click="finishTournament(row)">结束</el-button>
               </template>
             </el-table-column>
           </el-table>
+
+          <!-- ===== 开赛前球场可用性校验面板：校验中 / 可开赛 / 被阻止 / 已开始 ===== -->
+          <div class="panel" v-if="selectedTour" style="margin-top: 14px">
+            <div class="panel-head">
+              <span class="panel-title">开赛前球场可用性校验 · {{ selectedTour.name }}</span>
+              <span class="panel-desc">每次查看 / 重试都按最新球洞版本实时重算，不复用旧结果</span>
+            </div>
+            <div class="toolbar">
+              <el-tag :type="checkTagType(startCheck)" size="large" effect="dark">
+                {{ checking ? '校验中…' : (startCheck?.phase || '校验中…') }}
+              </el-tag>
+              <el-tag type="info" effect="plain" v-if="selectedTour.course">
+                球场：{{ selectedTour.course.name }}（应打 {{ selectedTour.course.holeCount }} 洞）
+              </el-tag>
+              <el-tag type="danger" effect="plain" v-else>球场：未绑定（基础数据不完整）</el-tag>
+              <el-tag type="info" effect="plain">赛事 v{{ selectedTour.version }}（{{ selectedTour.status }}）</el-tag>
+              <span class="spacer"></span>
+              <el-button :loading="checking" @click="recheck">重新校验（读最新球洞）</el-button>
+              <el-button type="warning" :loading="starting" :disabled="!canStart(selectedTour)"
+                         @click="startTournament(selectedTour)">开始赛事</el-button>
+            </div>
+
+            <template v-if="startCheck && !checking">
+              <!-- 可开赛 -->
+              <el-alert v-if="startCheck.phase === '可开赛'" type="success" :closable="false" show-icon class="ck-banner">
+                <template #title>
+                  全部 {{ startCheck.eligibleHoleNos.length }} 个应打球洞均为「开放」且标准杆 / 码距合法，可开赛。
+                  应打洞号：<b>{{ startCheck.eligibleHoleNos.join('、') }}</b>
+                </template>
+                <template #default>
+                  <div class="ck-sub">点击「开始赛事」将按当前最新球洞版本冻结应打洞集并推进到「进行中」；
+                    之后球洞改为维护 / 封闭不影响本轮，后续新赛事仍须重新校验。</div>
+                </template>
+              </el-alert>
+
+              <!-- 被阻止 -->
+              <el-alert v-else-if="startCheck.phase === '被阻止'" type="error" :closable="false" show-icon class="ck-banner">
+                <template #title>
+                  开赛被 {{ startCheck.blockedHoles.length }} 项问题阻止：赛事仍保持「报名中」，报名名单与成绩草稿不会被清除，也不会产生半个进行中状态。
+                </template>
+                <template #default>
+                  <div class="ck-sub">请管理员按下方修复提示处理球洞，随后点「重新校验」或再次「开始赛事」——每次重试都读取最新球洞版本。</div>
+                </template>
+              </el-alert>
+
+              <el-table v-if="startCheck.phase === '被阻止'" :data="startCheck.blockedHoles" border stripe class="ck-table">
+                <el-table-column label="洞号" width="80">
+                  <template #default="{ row }">{{ row.holeNo == null ? '球场' : `第 ${row.holeNo} 洞` }}</template>
+                </el-table-column>
+                <el-table-column label="当前状态" width="130">
+                  <template #default="{ row }">
+                    <el-tag :type="blockTagType(row.currentStatus)" size="small">{{ row.currentStatus }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="标准杆" width="80">
+                  <template #default="{ row }">{{ row.par ?? '—' }}</template>
+                </el-table-column>
+                <el-table-column label="码距" width="80">
+                  <template #default="{ row }">{{ row.yardage ?? '—' }}</template>
+                </el-table-column>
+                <el-table-column prop="reason" label="阻断原因" min-width="220" />
+                <el-table-column prop="fixHint" label="修复提示" min-width="240" />
+              </el-table>
+
+              <!-- 已开始（冻结） -->
+              <el-alert v-else-if="startCheck.phase === '已开始'" type="success" :closable="false" show-icon class="ck-banner">
+                <template #title>
+                  赛事已开始：本轮应打 {{ startCheck.eligibleHoleNos.length }} 洞已在开赛时冻结
+                  （{{ startCheck.eligibleHoleNos.join('、') }}）
+                </template>
+                <template #default>
+                  <div class="ck-sub">之后即使把球洞改为维护 / 封闭，本轮排行榜与记分卡仍按冻结洞集进行，不会静默改变本轮状态；
+                    后续新赛事没有冻结记录，必须重新校验。
+                    <span v-if="startCheck.checkedAt">开赛校验时间：{{ startCheck.checkedAt }}。</span>
+                  </div>
+                </template>
+              </el-alert>
+
+              <!-- 非阻断提示（额外洞等） -->
+              <el-alert v-if="startCheck.notices && startCheck.notices.length" type="warning"
+                        :closable="false" show-icon class="ck-banner">
+                <template #title>提示（{{ startCheck.notices.length }}）</template>
+                <ul class="ck-notice-list">
+                  <li v-for="(n, i) in startCheck.notices" :key="i">{{ n }}</li>
+                </ul>
+              </el-alert>
+
+              <div v-if="startCheck.lastAttemptType === '被阻止' && startCheck.phase === '被阻止'" class="ck-meta">
+                最近一次开赛尝试：{{ startCheck.lastAttemptType }}（{{ startCheck.checkedAt }}），已按最新状态实时重算
+              </div>
+            </template>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -405,6 +576,12 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
       <el-form :model="tourForm" label-width="110px" class="dialog-form">
         <el-form-item label="赛事编号"><el-input v-model="tourForm.tournamentNo" placeholder="如 T-2026-003" /></el-form-item>
         <el-form-item label="名称"><el-input v-model="tourForm.name" /></el-form-item>
+        <el-form-item label="绑定球场" class="full">
+          <el-select v-model="tourForm.courseId" clearable placeholder="选择球场（开赛前必须绑定）" style="width: 100%">
+            <el-option v-for="c in courses" :key="c.id"
+                       :label="`${c.name}（应打 ${c.holeCount} 洞）`" :value="c.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="开始日期"><el-date-picker v-model="tourForm.startDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item>
         <el-form-item label="结束日期"><el-date-picker v-model="tourForm.endDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item>
         <el-form-item label="地点"><el-input v-model="tourForm.location" /></el-form-item>
@@ -418,10 +595,16 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
       </template>
     </el-dialog>
 
-    <!-- 编辑赛事（含球场难度参数补齐） -->
+    <!-- 编辑赛事（含绑定球场与球场难度参数补齐） -->
     <el-dialog v-model="editDialog" title="编辑赛事" width="560px">
       <el-form :model="editForm" label-width="110px" class="dialog-form">
         <el-form-item label="名称"><el-input v-model="editForm.name" /></el-form-item>
+        <el-form-item label="绑定球场" class="full">
+          <el-select v-model="editForm.courseId" clearable placeholder="选择球场" style="width: 100%">
+            <el-option v-for="c in courses" :key="c.id"
+                       :label="`${c.name}（应打 ${c.holeCount} 洞）`" :value="c.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="开始日期"><el-date-picker v-model="editForm.startDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item>
         <el-form-item label="结束日期"><el-date-picker v-model="editForm.endDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" /></el-form-item>
         <el-form-item label="地点"><el-input v-model="editForm.location" /></el-form-item>
@@ -434,7 +617,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         <el-form-item label="备注" class="full"><el-input v-model="editForm.note" /></el-form-item>
       </el-form>
       <div class="muted" style="margin: -6px 0 8px 110px; font-size: 12px">
-        难度参数需成对维护（都填或都留空）；补齐后请到「差点中心 → 缺参与定向重算」重算受影响球员。
+        开赛前必须绑定球场并通过球场可用性校验；开赛后绑定冻结不可更换。难度参数需成对维护（都填或都留空）；补齐后请到「差点中心 → 缺参与定向重算」重算受影响球员。
       </div>
       <template #footer>
         <el-button @click="editDialog = false">取消</el-button>
@@ -452,7 +635,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         </el-form-item>
         <el-form-item label="球洞">
           <el-select v-model="scoreForm.holeId" style="width: 100%">
-            <el-option v-for="h in holes" :key="h.id" :label="`第 ${h.holeNo} 洞 · par ${h.par}`" :value="h.id" />
+            <el-option v-for="h in scoreHoleOptions" :key="h.id"
+                       :label="`第 ${h.holeNo} 洞 · par ${h.par} · ${h.status}${selectedTour?.course ? '（' + h.course?.name + '）' : ''}`"
+                       :value="h.id" />
           </el-select>
         </el-form-item>
         <el-form-item label="轮次"><el-input v-model="scoreForm.roundNo" type="number" min="1" /></el-form-item>
@@ -470,6 +655,11 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .lb-banner { margin-bottom: 10px; }
 .lb-banner-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .lb-fail-desc { margin-top: 4px; font-size: 12px; }
+.ck-banner { margin-bottom: 10px; }
+.ck-sub { margin-top: 4px; font-size: 12px; line-height: 1.7; }
+.ck-table { margin: 4px 0 12px; }
+.ck-notice-list { margin: 4px 0 0; padding-left: 18px; font-size: 12px; }
+.ck-meta { margin: 6px 2px 0; font-size: 12px; color: var(--el-color-info); }
 .lb-fail-box {
   border: 1px solid var(--el-color-danger);
   background: var(--el-color-danger-light-9);

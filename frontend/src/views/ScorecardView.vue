@@ -26,6 +26,14 @@ const scorerRoundNo = ref(1)
 const scorerName = ref('记分员小周')
 const activeCard = ref(null)
 
+// 记分卡详情只看该卡所属赛事绑定球场的洞（球洞按球场隔离后，同洞号可能分属不同球场）；
+// 历史赛事未绑定球场时回退展示全部洞。
+const cardHoles = computed(() => {
+  const cid = tournaments.value.find(t => t.id === activeCard.value?.tournamentId)?.course?.id
+  if (!cid) return holes.value
+  return holes.value.filter(h => h.course?.id === cid)
+})
+
 // 球员
 const myPlayerId = ref(null)
 const myCards = ref([])
@@ -371,7 +379,7 @@ const toParText = (n) => n == null ? '-' : (n === 0 ? 'E' : (n > 0 ? `+${n}` : `
       <!-- 记分员/球员共用的逐洞详情 -->
       <el-tab-pane v-if="activeCard && ['scorer-detail', 'player'].includes(activeTab)"
         :label="`记分卡详情 #${activeCard.id}`" name="scorer-detail">
-        <scorer-detail :card="activeCard" :holes="holes"
+        <scorer-detail :card="activeCard" :holes="cardHoles"
           @save-stroke="saveStroke" @submit="submitCard"
           @confirm="confirmWholeCard" @dispute="raiseDispute" @back="backFromDetail" />
       </el-tab-pane>

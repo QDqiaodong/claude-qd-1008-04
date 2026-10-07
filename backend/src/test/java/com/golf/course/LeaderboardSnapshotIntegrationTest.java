@@ -28,12 +28,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.golf.course.common.ConflictException;
 import com.golf.course.dto.LeaderboardView;
+import com.golf.course.entity.Course;
 import com.golf.course.entity.Hole;
 import com.golf.course.entity.LeaderboardSnapshot;
 import com.golf.course.entity.Player;
 import com.golf.course.entity.Score;
 import com.golf.course.entity.Tournament;
 import com.golf.course.entity.TournamentEntry;
+import com.golf.course.repository.CourseRepository;
 import com.golf.course.repository.HoleRepository;
 import com.golf.course.repository.LeaderboardSnapshotRepository;
 import com.golf.course.repository.PlayerRepository;
@@ -50,6 +52,8 @@ class LeaderboardSnapshotIntegrationTest {
 
     @Autowired
     private TournamentRepository tournamentRepository;
+    @Autowired
+    private CourseRepository courseRepository;
     @Autowired
     private PlayerRepository playerRepository;
     @Autowired
@@ -87,6 +91,7 @@ class LeaderboardSnapshotIntegrationTest {
         jdbc.execute("DELETE FROM scorecard_hole");
         jdbc.execute("DELETE FROM scorecard");
         jdbc.execute("DELETE FROM tournament_entry");
+        jdbc.execute("DELETE FROM tournament_start_check");
         jdbc.execute("DELETE FROM score");
         jdbc.execute("DELETE FROM leaderboard_snapshot");
         jdbc.execute("DELETE FROM leaderboard");
@@ -94,10 +99,19 @@ class LeaderboardSnapshotIntegrationTest {
         jdbc.execute("DELETE FROM tournament");
         jdbc.execute("DELETE FROM player");
         jdbc.execute("DELETE FROM hole");
+        jdbc.execute("DELETE FROM course");
+
+        Course course = new Course();
+        course.setCourseNo("C-T");
+        course.setName("测试场");
+        course.setHoleCount(5);
+        course.setCreatedAt(LocalDateTime.now());
+        course = courseRepository.save(course);
 
         int[][] pars = {{1, 4}, {2, 5}, {3, 3}, {4, 4}, {5, 3}};
         for (int[] hp : pars) {
             Hole h = new Hole();
+            h.setCourse(course);
             h.setHoleNo(hp[0]);
             h.setPar(hp[1]);
             h.setYardage(300 + hp[0] * 10);
@@ -121,6 +135,7 @@ class LeaderboardSnapshotIntegrationTest {
         Tournament t = new Tournament();
         t.setTournamentNo(no);
         t.setName(name);
+        t.setCourse(courseRepository.findByCourseNo("C-T").orElseThrow());
         t.setStartDate(LocalDate.of(2026, 10, 10));
         t.setEndDate(LocalDate.of(2026, 10, 12));
         t.setStatus(status);

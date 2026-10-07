@@ -30,13 +30,16 @@ public class ScoreService {
     private final PlayerRepository playerRepository;
     private final TournamentRepository tournamentRepository;
     private final HoleRepository holeRepository;
+    private final TournamentStartService tournamentStartService;
 
     public ScoreService(ScoreRepository scoreRepository, PlayerRepository playerRepository,
-                        TournamentRepository tournamentRepository, HoleRepository holeRepository) {
+                        TournamentRepository tournamentRepository, HoleRepository holeRepository,
+                        TournamentStartService tournamentStartService) {
         this.scoreRepository = scoreRepository;
         this.playerRepository = playerRepository;
         this.tournamentRepository = tournamentRepository;
         this.holeRepository = holeRepository;
+        this.tournamentStartService = tournamentStartService;
     }
 
     public List<Score> list(Long tournamentId, Long playerId) {
@@ -69,6 +72,28 @@ public class ScoreService {
         }
         Player player = resolvePlayer(input.getPlayer());
         Hole hole = resolveHole(input.getHole());
+        // 只能给本场应打球洞录成绩：已开赛按开赛冻结洞集，之后把该洞改成维护 / 封闭不影响本轮录入；
+        // 其他球场的洞、或本轮应打集之外的洞一律拒绝（正式排行榜只认开赛放行的洞）。
+        List<Hole> eligible = tournamentStartService.eligibleHolesFor(locked);
+        boolean inEligible = eligible.stream().anyMatch(h -> h.getId().equals(hole.getId()));
+        if (!inEligible) {
+            if (!"报名中".equals(locked.getStatus())) {
+                throw new BizException("第 " + hole.getHoleNo() + " 洞不属于赛事「" + locked.getName()
+                        + "」本场应打球洞（开赛冻结洞集之外），不能录入成绩");
+            }
+            // 报名中尚未开赛：只能给绑定球场的当前开放洞录草稿；
+            // 非本场球场洞、维护 / 封闭洞一律拒绝
+            Long courseId = locked.getCourse() == null ? null : locked.getCourse().getId();
+            if (courseId != null && (hole.getCourse() == null
+                    || !courseId.equals(hole.getCourse().getId()))) {
+                throw new BizException("第 " + hole.getHoleNo() + " 洞不属于赛事「" + locked.getName()
+                        + "」绑定的球场，不能录入成绩");
+            }
+            if (!"开放".equals(hole.getStatus())) {
+                throw new BizException("第 " + hole.getHoleNo() + " 洞当前为「" + hole.getStatus()
+                        + "」，非开放球洞，不能录入成绩");
+            }
+        }
         if (input.getRoundNo() == null || input.getRoundNo() < 1) {
             throw new BizException("轮次必须大于 0");
         }

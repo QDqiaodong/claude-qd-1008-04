@@ -13,6 +13,8 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import com.golf.course.dto.StartCheckView;
+
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
@@ -20,8 +22,18 @@ public class GlobalExceptionHandler {
      * 业务校验失败：400 + 中文业务提示
      */
     @ExceptionHandler(BizException.class)
-    public ResponseEntity<ApiResponse<Void>> handleBiz(BizException e) {
+    public ResponseEntity<ApiResponse<Object>> handleBiz(BizException e) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiResponse.fail(e.getMessage()));
+    }
+
+    /**
+     * 开赛校验未通过：400 + 逐洞阻断明细。响应体 data 带按最新球洞版本重算的校验视图
+     * （受影响洞号 / 当前状态 / 修复提示 / 当前赛事版本），前端直接渲染阻止面板，无需再次请求。
+     */
+    @ExceptionHandler(StartBlockedException.class)
+    public ResponseEntity<ApiResponse<StartCheckView>> handleStartBlocked(StartBlockedException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse<>(false, e.getMessage(), e.view()));
     }
 
     /**
@@ -29,8 +41,18 @@ public class GlobalExceptionHandler {
      * 不能让后到的写静默覆盖先到者的结果。
      */
     @ExceptionHandler(ConflictException.class)
-    public ResponseEntity<ApiResponse<Void>> handleConflict(ConflictException e) {
+    public ResponseEntity<ApiResponse<Object>> handleConflict(ConflictException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(e.getMessage()));
+    }
+
+    /**
+     * 开赛 / 维护球洞的并发冲突：409 + 当前赛事与球洞状态（校验视图），
+     * 前端据此提示「数据已变化」并把页面刷新到返回的最新状态。
+     */
+    @ExceptionHandler(StartConflictException.class)
+    public ResponseEntity<ApiResponse<StartCheckView>> handleStartConflict(StartConflictException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false, e.getMessage(), e.view()));
     }
 
     /**
@@ -39,17 +61,17 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
     public ResponseEntity<ApiResponse<Void>> handleOptimisticLock(ObjectOptimisticLockingFailureException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(
-                "赛事数据已变化：他人已先一步推进收口 / 改动成绩，你的页面版本已过期，本次操作未生效；请重新读取当前排行榜与赛事状态后再试"));
+                "数据已变化：他人已先一步开赛 / 推进收口 / 维护球洞或改动成绩，你的页面版本已过期，本次操作未生效；请重新读取当前赛事与球洞（排行榜）状态后再试"));
     }
 
     /**
-     * 悲观行锁争用兜底：两人同时推进赛事收口、或收口与补录成绩并发时，
-     * 后到者在赛事行锁上等待超时——只有一个版本能成为正式快照，其余一律 409 并要求重读。
+     * 悲观行锁争用兜底：两人同时开赛、同时维护同一球洞、或开赛与收口 / 录成绩并发时，
+     * 后到者在赛事行锁 / 球洞行锁上等待超时——只有基于最新版本的一次能成功，其余一律 409 并要求重读。
      */
     @ExceptionHandler(CannotAcquireLockException.class)
     public ResponseEntity<ApiResponse<Void>> handleLockContention(CannotAcquireLockException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(
-                "赛事正被他人推进收口或录入成绩，当前状态已变化，本次操作未生效；请重新读取排行榜与赛事状态后再试"));
+                "赛事 / 球洞正被他人开赛、维护或录入成绩，当前状态已变化，本次操作未生效；请重新读取赛事与球洞（排行榜）状态后再试"));
     }
 
     /**

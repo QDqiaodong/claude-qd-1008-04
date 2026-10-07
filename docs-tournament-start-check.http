@@ -1,0 +1,79 @@
+-- 赛事开赛前球场可用性校验 · 端到端手工验证脚本（按顺序执行）
+-- 前置：./start.sh 起服务。
+-- 种子：赛事 1「金秋会员邀请赛」绑定 A 场（9 洞，第 5 洞维护、第 9 洞封闭），报名中；
+--      赛事 2 未绑定球场，报名中；赛事 7 已开赛并冻结 9 洞。
+
+-- ===== A. 只读校验：可开赛 / 被阻止 / 已开始（不落痕迹） =====
+
+-- A1. 赛事 1：被阻止（第 5 洞维护、第 9 洞封闭），phase=被阻止，blockedHoles 两条
+--     每条含 holeNo / currentStatus / par / yardage / reason / fixHint
+GET /api/tournaments/1/start-check
+
+-- A2. 赛事 2：未绑定球场 → blockedHoles[0].holeNo=null, currentStatus=基础数据不完整
+GET /api/tournaments/2/start-check
+
+-- A3. 赛事 7：已开始（冻结 1~9 洞，frozen=true，eligibleHoleNos=1..9）
+GET /api/tournaments/7/start-check
+
+-- ===== B. 开赛失败：400 + 阻断明细，赛事仍报名中 =====
+
+-- B1. 直接开赛 → 400；响应体 data.phase=被阻止，data.blockedHoles 含第 5、9 洞
+POST /api/tournaments/1/start
+
+-- B2. 赛事仍是「报名中」（无半个进行中状态）；报名名单、记分卡草稿都还在
+GET /api/tournaments/1
+GET /api/scorecards?tournamentId=1
+
+-- B3. 留痕表为「被阻止」（可查库确认；接口不直接暴露）
+-- SELECT check_type, blocked_holes_json, eligible_hole_nos FROM tournament_start_check WHERE tournament_id=1;
+
+-- ===== C. 修复后重试：读取最新球洞版本，旧失败被覆盖 =====
+
+-- C1. 把第 5 洞（hole id=5）、第 9 洞（id=9）改回开放
+POST /api/holes/5/status?target=开放
+POST /api/holes/9/status?target=开放
+
+-- C2. 重新只读校验 → 可开赛，eligibleHoleNos=1..9
+GET /api/tournaments/1/start-check
+
+-- C3. 开赛 → 200，phase=已开始；赛事翻「进行中」，留痕被覆盖为「可开赛」
+POST /api/tournaments/1/start
+
+-- C4. 再次开赛 / 用旧版本开赛 → 409，data 为最新「已开始」视图
+POST /api/tournaments/1/start?expectedVersion=0
+
+-- ===== D. 开赛后冻结：后续改维护不影响本轮；新赛事重新校验 =====
+
+-- D1. 开赛后把第 3 洞改维护
+POST /api/holes/3/status?target=开放
+POST /api/holes/3/status?target=维护
+
+-- D2. 赛事 1 校验视图仍是「已开始」、冻结洞集仍含 3；排行榜按冻结 9 洞
+GET /api/tournaments/1/start-check
+GET /api/tournaments/1/leaderboard
+
+-- D3. 新建赛事绑定 A 场（holeCount=9）
+POST /api/courses/1
+POST /api/tournaments   {"tournamentNo":"T-CHK-1","name":"校验新赛事","course":{"id":1},"status":"报名中"}
+
+-- D4. 新赛事必须重新校验 → 被第 3（维护）洞阻止
+GET /api/tournaments/8/start-check
+
+-- ===== E. 并发维护同一球洞：过期版本 409 =====
+-- E1. 先读第 8 洞版本
+GET /api/holes/8
+-- E2. 两人先后改状态：第二个带过期 expectedVersion → 409「球洞数据已变化」
+POST /api/holes/8/status?target=维护
+POST /api/holes/8/status?target=开放&expectedVersion=0
+
+-- ===== F. 状态机入口等价：advance target=进行中 同样走开赛校验 =====
+-- 先把 3 号洞修复（若上面已维护）
+POST /api/holes/3/status?target=开放
+POST /api/tournaments/8/advance?target=进行中
+
+-- ===== G. 球场与绑定维护 =====
+GET /api/courses
+-- 给赛事 2 绑定 B 场（全 9 洞开放）：PUT body 中携带 course 即更新绑定（仅报名中允许）
+PUT /api/tournaments/2    {"name":"青少年高尔夫训练营","course":{"id":2}}
+-- 绑定后即可开赛
+POST /api/tournaments/2/start
